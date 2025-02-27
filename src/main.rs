@@ -1,9 +1,12 @@
 use cdk::amount::SplitTarget;
-use cdk::nuts::{CurrencyUnit, MintQuoteState, PublicKey, SpendingConditions, Proof};
+use cdk::nuts::{CurrencyUnit, MintQuoteState, Proof, PublicKey, SecretKey, SpendingConditions};
 use cdk::Amount;
 use cdk::{cdk_database::WalletMemoryDatabase, wallet::Wallet};
 use nostr_database::Events;
-use nostr_sdk::{Client, EventBuilder, Filter, Keys, Kind, RelayUrl, Tag, TagStandard, SingleLetterTag, Alphabet};
+use nostr_sdk::{
+    Alphabet, Client, EventBuilder, Filter, Keys, Kind, RelayUrl, SingleLetterTag, Tag, TagStandard,
+};
+use std::vec;
 use std::{collections::HashMap, str::FromStr, sync::Arc};
 use tokio::time::{sleep, Duration};
 
@@ -104,12 +107,18 @@ async fn make_nutzap_payment(client: &Client) {
         )
         .await
         .unwrap();
-    
+
     println!("Publishing to nostr");
-    
+
     // sending the nutzap event
     let event = EventBuilder::new(Kind::Custom(9321), "Tollgate payment")
-        .tag(Tag::parse(vec!["proof", &serde_json::to_string(&receive_amount[0]).unwrap()]).unwrap())
+        .tag(
+            Tag::parse(vec![
+                "proof",
+                &serde_json::to_string(&receive_amount[0]).unwrap(),
+            ])
+            .unwrap(),
+        )
         .tag(Tag::parse(vec!["u", mint_url]).unwrap())
         .tag(Tag::parse(vec!["e", &nutzap_info_event.id.to_string(), relay_url]).unwrap())
         .tag(Tag::parse(vec!["p", &nutzap_info_event.pubkey.to_string()]).unwrap());
@@ -118,10 +127,17 @@ async fn make_nutzap_payment(client: &Client) {
 
 async fn verify_payment(client: &Client) {
     let nostr_keys = get_keys(NOSTR_S);
-    let filter = Filter::new()
-        .kind(Kind::Custom(9321))
-        .custom_tag(SingleLetterTag { character: Alphabet::P, uppercase: false }, nostr_keys.public_key);
-    let events = client.fetch_events(filter, Duration::from_secs(4)).await.unwrap();
+    let filter = Filter::new().kind(Kind::Custom(9321)).custom_tag(
+        SingleLetterTag {
+            character: Alphabet::P,
+            uppercase: false,
+        },
+        nostr_keys.public_key,
+    );
+    let events = client
+        .fetch_events(filter, Duration::from_secs(4))
+        .await
+        .unwrap();
     dbg!(&events);
 
     let mut proof: Option<Proof> = None;
@@ -142,7 +158,16 @@ async fn verify_payment(client: &Client) {
         None,
     )
     .unwrap();
-    wallet.swap(None, SplitTarget::None, vec![proof.unwrap()], None, true).await.unwrap();
+    let proof = proof.unwrap();
+    wallet
+        .receive_proofs(
+            vec![proof],
+            SplitTarget::None,
+            &[SecretKey::from_hex(MERCHANT_CASHU_SECRET).unwrap()],
+            &[],
+        )
+        .await
+        .unwrap();
     println!("received the payment");
     println!("Updated balance {:?}", wallet.total_balance().await);
 }
