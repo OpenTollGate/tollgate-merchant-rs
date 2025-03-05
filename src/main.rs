@@ -1,14 +1,27 @@
+use bytes::{Buf, Bytes};
 use cdk::amount::SplitTarget;
 use cdk::nuts::{CurrencyUnit, MintQuoteState, Proof, PublicKey, SecretKey, SpendingConditions};
+use cdk::wallet::client;
 use cdk::Amount;
-use cdk::{cdk_database::WalletMemoryDatabase, wallet::Wallet};
+use cdk::{cdk_database::WalletMemoryDatabase, wallet::Wallet, Error};
+use http_body_util::{BodyExt, Full};
+use hyper::server::conn::http1;
+use hyper::{header, Method, StatusCode};
+use hyper_util::rt::TokioIo;
 use nostr_database::Events;
 use nostr_sdk::{
     Alphabet, Client, EventBuilder, Filter, Keys, Kind, RelayUrl, SingleLetterTag, Tag, TagStandard,
 };
+use std::net::SocketAddr;
 use std::vec;
 use std::{collections::HashMap, str::FromStr, sync::Arc};
+use tokio::net::TcpListener;
 use tokio::time::{sleep, Duration};
+
+use hyper::service::service_fn;
+use hyper::{body::Incoming as IncomingBody, Request, Response};
+use std::convert::Infallible;
+use serde::{Serialize, Deserialize};
 
 const NOSTR_S: &str = "f4be433e9208024b8d3ce6ab4798f0b8bfd87c3344a633a72af0fbdc6c352ac5";
 const CNOSTR_S: &str = "f4be430e9208024b8d3ce6ab4798f0b8bfd87c3344a633a72af0fbdc6c352ac5";
@@ -17,6 +30,7 @@ const MERCHANT_CASHU_SECRET: &str =
 const USER_CASHU_SECRET: &str = "a4be433e9648024b8d3ce6ab4898f0b8bfd87c3344a633a72af0fbdc6c352ac6";
 const RELAY_URL: &str = "ws://127.0.0.1:8080";
 const CASHU_URL: &str = "https://testnut.cashu.space";
+static NOTFOUND: &[u8] = b"Not Found";
 
 fn nutzap_info_kind() -> Kind {
     Kind::from_u16(10019)
@@ -41,7 +55,6 @@ async fn publish_nutzap_info(client: &Client) {
     let events = get_nutzap_info(client).await;
     if events.len() > 0 {
         println!("nutzap info already exists");
-        dbg!(&events);
         return;
     }
 
@@ -52,7 +65,6 @@ async fn publish_nutzap_info(client: &Client) {
         )))
         .tag(Tag::parse(vec!["mint", CASHU_URL, "sat"]).unwrap())
         .tag(Tag::parse(vec!["pubkey", &cashu_keys.public_key.to_string()]).unwrap());
-    dbg!(&event);
     client.send_event_builder(event).await.unwrap();
 }
 
@@ -109,6 +121,7 @@ async fn make_nutzap_payment(client: &Client) {
         .unwrap();
 
     println!("Publishing to nostr");
+    let cnostr_keys = get_keys(CNOSTR_S);
 
     // sending the nutzap event
     let event = EventBuilder::new(Kind::Custom(9321), "Tollgate payment")
@@ -121,24 +134,35 @@ async fn make_nutzap_payment(client: &Client) {
         )
         .tag(Tag::parse(vec!["u", mint_url]).unwrap())
         .tag(Tag::parse(vec!["e", &nutzap_info_event.id.to_string(), relay_url]).unwrap())
-        .tag(Tag::parse(vec!["p", &nutzap_info_event.pubkey.to_string()]).unwrap());
+        .tag(Tag::parse(vec!["p", &nutzap_info_event.pubkey.to_string()]).unwrap())
+        .tag(Tag::parse(vec!["d", &cnostr_keys.public_key.to_string()]).unwrap());
+    // d tag is used to identify the payment of the user
     client.send_event_builder(event).await.unwrap();
 }
 
-async fn verify_payment(client: &Client) {
+async fn verify_payment(user_pubkey: &str) -> Result<Amount, Error> {
+    let client = get_nostr_client(NOSTR_S).await;
     let nostr_keys = get_keys(NOSTR_S);
-    let filter = Filter::new().kind(Kind::Custom(9321)).custom_tag(
-        SingleLetterTag {
-            character: Alphabet::P,
-            uppercase: false,
-        },
-        nostr_keys.public_key,
-    );
+    let filter = Filter::new()
+        .kind(Kind::Custom(9321))
+        .custom_tag(
+            SingleLetterTag {
+                character: Alphabet::P,
+                uppercase: false,
+            },
+            nostr_keys.public_key,
+        )
+        .custom_tag(
+            SingleLetterTag {
+                character: Alphabet::D,
+                uppercase: false,
+            },
+            user_pubkey,
+        );
     let events = client
         .fetch_events(filter, Duration::from_secs(4))
         .await
         .unwrap();
-    dbg!(&events);
 
     let mut proof: Option<Proof> = None;
     for event in events.into_iter() {
@@ -167,29 +191,128 @@ async fn verify_payment(client: &Client) {
             &[],
         )
         .await
-        .unwrap();
-    println!("received the payment");
-    println!("Updated balance {:?}", wallet.total_balance().await);
+}
+
+type GenericError = Box<dyn std::error::Error + Send + Sync>;
+type BoxBody = http_body_util::combinators::BoxBody<Bytes, GenericError>;
+
+fn full<T: Into<Bytes>>(chunk: T) -> BoxBody {
+    Full::new(chunk.into())
+        .map_err(|never| match never {})
+        .boxed()
+}
+
+#[derive(Deserialize)]
+struct NotifyPaymentRequestPayload {
+    user_pubkey: String,
+}
+
+#[derive(Serialize)]
+struct NotifyPaymentResponsePayload {
+    amount: u64,
+}
+
+#[derive(Serialize)]
+struct ErrorResponse {
+    error: String,
+}
+
+type ResponseResult = Result<Response<BoxBody>, GenericError>;
+async fn notify_paynent(req: Request<IncomingBody>) -> ResponseResult {
+    // Aggregate the body...
+    let whole_body = req.collect().await?.aggregate();
+    // Decode as JSON...
+
+    let data: NotifyPaymentRequestPayload = match serde_json::from_reader(whole_body.reader()) {
+        Ok(payload) => payload,
+        Err(_) => {
+            let error_response = Response::builder()
+                .status(StatusCode::BAD_REQUEST)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(full(
+                    serde_json::to_string(&ErrorResponse {
+                        error: "Invalid request payload".to_string(),
+                    })?,
+                ))?;
+            return Ok(error_response);
+        }
+    };
+
+    match verify_payment(&data.user_pubkey).await  {
+        Ok(amount) => {
+            let response = Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(full(serde_json::to_string(&NotifyPaymentResponsePayload {amount: amount.into()})? ))?;
+            Ok(response)
+        },
+        Err(err) => {
+            let error_response = Response::builder()
+                .status(StatusCode::PAYMENT_REQUIRED) // HTTP 402 for failed payments
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(full(
+                    serde_json::to_string(&ErrorResponse {
+                        error: format!("Payment failed: {}", err),
+                    })?,
+                ))?;
+            Ok(error_response)
+        }
+    }
+
+}
+
+async fn root(req: Request<IncomingBody>) -> ResponseResult {
+    match (req.method(), req.uri().path()) {
+        (&Method::POST, "/notify_payment") => notify_paynent(req).await,
+        _ => {
+            // Return 404 not found response.
+            Ok(Response::builder()
+                .status(StatusCode::NOT_FOUND)
+                .body(full(NOTFOUND))
+                .unwrap())
+        }
+    }
+}
+
+async fn get_nostr_client(key: &str) -> Client {
+    let nostr_keys = get_keys(key);
+    let client = Client::builder().signer(nostr_keys.clone()).build();
+    client.add_relay(RELAY_URL).await.unwrap();
+    client.connect().await;
+    client
 }
 
 #[tokio::main]
-async fn main() {
-    println!("Tollgate merchant setup");
+async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // publish nutzap event
 
-    let nostr_keys = get_keys(NOSTR_S);
-    let client = &Client::builder().signer(nostr_keys.clone()).build();
-    client.add_relay(RELAY_URL).await.unwrap();
-    client.connect().await;
-
+    let client = &get_nostr_client(NOSTR_S).await;
+    println!("Receiver publishes their nutzapp info");
     publish_nutzap_info(client).await;
 
-    println!("User retrives nutzap information to make payment");
-    let cnostr_keys = get_keys(CNOSTR_S);
-    let cclient = &Client::builder().signer(cnostr_keys.clone()).build();
-    cclient.add_relay(RELAY_URL).await.unwrap();
-    cclient.connect().await;
-    make_nutzap_payment(cclient).await;
+    let addr = SocketAddr::from(([127, 0, 0, 1], 5122));
 
-    println!("Merchant Verifies payment");
-    verify_payment(client).await;
+    // We create a TcpListener and bind it to 127.0.0.1:3000
+    let listener = TcpListener::bind(addr).await?;
+
+    // We start a loop to continuously accept incoming connections
+    loop {
+        let (stream, _) = listener.accept().await?;
+
+        // Use an adapter to access something implementing `tokio::io` traits as if they implement
+        // `hyper::rt` IO traits.
+        let io = TokioIo::new(stream);
+
+        // Spawn a tokio task to serve multiple connections concurrently
+        tokio::task::spawn(async move {
+            // Finally, we bind the incoming connection to our `hello` service
+            if let Err(err) = http1::Builder::new()
+                // `service_fn` converts our function in a `Service`
+                .serve_connection(io, service_fn(root))
+                .await
+            {
+                eprintln!("Error serving connection: {:?}", err);
+            }
+        });
+    }
 }
