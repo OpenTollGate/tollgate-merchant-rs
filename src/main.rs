@@ -140,7 +140,7 @@ async fn make_nutzap_payment(client: &Client) {
     client.send_event_builder(event).await.unwrap();
 }
 
-async fn verify_payment(user_pubkey: &str) -> Result<Amount, Error> {
+async fn verify_payment(user_mac_address: &str) -> Result<Amount, Error> {
     let client = get_nostr_client(NOSTR_S).await;
     let nostr_keys = get_keys(NOSTR_S);
     let filter = Filter::new()
@@ -157,7 +157,7 @@ async fn verify_payment(user_pubkey: &str) -> Result<Amount, Error> {
                 character: Alphabet::D,
                 uppercase: false,
             },
-            user_pubkey,
+            user_mac_address,
         );
     let events = client
         .fetch_events(filter, Duration::from_secs(4))
@@ -204,7 +204,7 @@ fn full<T: Into<Bytes>>(chunk: T) -> BoxBody {
 
 #[derive(Deserialize)]
 struct NotifyPaymentRequestPayload {
-    user_pubkey: String,
+    user_mac_address: String,
 }
 
 #[derive(Serialize)]
@@ -238,7 +238,7 @@ async fn notify_paynent(req: Request<IncomingBody>) -> ResponseResult {
         }
     };
 
-    match verify_payment(&data.user_pubkey).await  {
+    match verify_payment(&data.user_mac_address).await  {
         Ok(amount) => {
             let response = Response::builder()
                 .status(StatusCode::OK)
